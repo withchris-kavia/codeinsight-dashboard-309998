@@ -89,6 +89,26 @@ class DayCountPoint(BaseModel):
     count: int = Field(..., description="Count for that day.")
 
 
+class PullRequestsDayPoint(BaseModel):
+    day: date = Field(..., description="Day (UTC date).")
+    opened: int = Field(..., description="PRs opened (count of pull_request events) for that day.")
+    merged: int = Field(..., description="PRs merged (count of merge events) for that day.")
+
+
+class DashboardMetricsResponse(BaseModel):
+    org_id: UUID = Field(..., description="Organization UUID.")
+    repo_id: Optional[UUID] = Field(default=None, description="Repo UUID if scoped.")
+    start_ts: datetime = Field(..., description="UTC start timestamp used (inclusive).")
+    end_ts: datetime = Field(..., description="UTC end timestamp used (exclusive).")
+
+    commits_per_day: List[DayCountPoint] = Field(..., description="Commits time-series for charts.")
+    prs_per_day: List[PullRequestsDayPoint] = Field(..., description="PRs opened/merged time-series for charts.")
+    prs_merged_per_repo: List[RepoCountPoint] = Field(..., description="Top repos by merged PRs for charts/tables.")
+
+    active_contributors: int = Field(..., description="Distinct active contributors in the time range.")
+    recent_activity: List[RecentActivityItem] = Field(..., description="Recent activity feed items.")
+
+
 class RepoCountPoint(BaseModel):
     repo_id: UUID = Field(..., description="Repo UUID.")
     repo_full_name: str = Field(..., description="Repo full name (owner/name).")
@@ -405,6 +425,170 @@ def commits_per_day(
     ).mappings().all()
 
     return [DayCountPoint(day=r["day"], count=int(r["count"])) for r in rows]
+
+
+# PUBLIC_INTERFACE
+@router.get(
+    "/prs-per-day",
+    summary="PRs opened and merged per day",
+    description=(
+        "Returns daily PR opened and PR merged counts based on analytics_repo_daily.\\n\\n"
+        "If repo_id is omitted, sums across all repos in the org.\\n\\n"
+        "Note: merged counts are derived from normalized `merge` events."
+    ),
+    operation_id="analytics_prs_per_day_get",
+    response_model=List[PullRequestsDayPoint],
+)
+def prs_per_day(
+    org_id: UUID = Query(..., description="Organization UUID."),
+    repo_id: Optional[UUID] = Query(default=None, description="Optional repo UUID."),
+    start_date: Optional[date] = Query(default=None, description="Start date (inclusive, UTC)."),
+    end_date: Optional[date] = Query(default=None, description="End date (exclusive, UTC)."),
+    db: Session = Depends(get_db_session),
+) -> List[PullRequestsDayPoint]:
+    """Fetch PR opened/merged per day for org/repo using precomputed analytics."""
+    _validate_org_repo_scope(org_id, repo_id, db)
+    start_ts, end_ts = _utc_dt_range_from_dates(start_date, end_date)
+
+    sql = text(
+        """
+        SELECT
+          ard.day AS day,
+          SUM(ard.prs_opened_count)::int AS opened,
+          SUM(ard.prs_merged_count)::int AS merged
+        FROM analytics_repo_daily ard
+        WHERE ard.org_id = :org_id
+          AND (:repo_id::uuid IS NULL OR ard.repo_id = :repo_id::uuid)
+          AND ard.day >= (:start_ts AT TIME ZONE 'UTC')::date
+          AND ard.day <  (:end_ts AT TIME ZONE 'UTC')::date
+        GROUP BY ard.day
+        ORDER BY ard.day ASC
+        """
+    )
+
+    rows = db.execute(
+        sql,
+        {
+            "org_id": str(org_id),
+            "repo_id": (str(repo_id) if repo_id is not None else None),
+            "start_ts": start_ts,
+            "end_ts": end_ts,
+        },
+    ).mappings().all()
+
+    return [
+        PullRequestsDayPoint(
+            day=r["day"],
+            opened=int(r["opened"] or 0),
+            merged=int(r["merged"] or 0),
+        )
+        for r in rows
+    ]
+
+
+# PUBLIC_INTERFACE
+@router.get(
+    "/dashboard",
+    summary="Dashboard metrics (single call)",
+    description=(
+        "Returns a compact, dashboard-ready bundle of analytics metrics in a single request.\\n\\n"
+        "This is designed for the frontend dashboard view to minimize round-trips.\\n\\n"
+        "Data sources:\\n"
+        "- commits_per_day: analytics_repo_daily\\n"
+        "- prs_per_day: analytics_repo_daily\\n"
+        "- prs_merged_per_repo: analytics_repo_daily joined with repos\\n"
+        "- active_contributors: analytics_dev_daily (with git_events fallback)\\n"
+        "- recent_activity: git_events joined with repos\\n\\n"
+        "Tip: call POST /analytics/compute first (same date window) to ensure aggregates are up-to-date."
+    ),
+    operation_id="analytics_dashboard_get",
+    response_model=DashboardMetricsResponse,
+)
+def dashboard_metrics(
+    org_id: UUID = Query(..., description="Organization UUID."),
+    repo_id: Optional[UUID] = Query(default=None, description="Optional repo UUID."),
+    start_date: Optional[date] = Query(default=None, description="Start date (inclusive, UTC)."),
+    end_date: Optional[date] = Query(default=None, description="End date (exclusive, UTC)."),
+    recent_limit: int = Query(default=50, ge=1, le=200, description="Max recent activity items."),
+    top_repos_limit: int = Query(default=10, ge=1, le=200, description="Max repos in merged-PR ranking."),
+    db: Session = Depends(get_db_session),
+) -> DashboardMetricsResponse:
+    """Fetch a dashboard-ready set of analytics metrics."""
+    _validate_org_repo_scope(org_id, repo_id, db)
+    start_ts, end_ts = _utc_dt_range_from_dates(start_date, end_date)
+
+    commits_series = commits_per_day(
+        org_id=org_id,
+        repo_id=repo_id,
+        start_date=start_date,
+        end_date=end_date,
+        db=db,
+    )
+
+    prs_series = prs_per_day(
+        org_id=org_id,
+        repo_id=repo_id,
+        start_date=start_date,
+        end_date=end_date,
+        db=db,
+    )
+
+    # If dashboard is scoped to a repo, still return "merged per repo" as just that repo for consistency.
+    if repo_id is not None:
+        sql = text(
+            """
+            SELECT
+              r.id AS repo_id,
+              r.full_name AS repo_full_name,
+              COALESCE(SUM(ard.prs_merged_count), 0)::int AS count
+            FROM repos r
+            LEFT JOIN analytics_repo_daily ard
+              ON ard.repo_id = r.id
+              AND ard.day >= (:start_ts AT TIME ZONE 'UTC')::date
+              AND ard.day <  (:end_ts AT TIME ZONE 'UTC')::date
+            WHERE r.org_id = :org_id
+              AND r.id = :repo_id::uuid
+            GROUP BY r.id, r.full_name
+            ORDER BY count DESC, r.full_name ASC
+            """
+        )
+        rows = db.execute(
+            sql,
+            {"org_id": str(org_id), "repo_id": str(repo_id), "start_ts": start_ts, "end_ts": end_ts},
+        ).mappings().all()
+        merged_per_repo = [
+            RepoCountPoint(repo_id=r["repo_id"], repo_full_name=r["repo_full_name"], count=int(r["count"])) for r in rows
+        ]
+    else:
+        merged_per_repo = prs_merged_per_repo(
+            org_id=org_id,
+            start_date=start_date,
+            end_date=end_date,
+            limit=int(top_repos_limit),
+            db=db,
+        )
+
+    active = active_contributors(
+        org_id=org_id,
+        repo_id=repo_id,
+        start_date=start_date,
+        end_date=end_date,
+        db=db,
+    )
+
+    recent = recent_activity(org_id=org_id, repo_id=repo_id, limit=int(recent_limit), db=db)
+
+    return DashboardMetricsResponse(
+        org_id=org_id,
+        repo_id=repo_id,
+        start_ts=start_ts,
+        end_ts=end_ts,
+        commits_per_day=commits_series,
+        prs_per_day=prs_series,
+        prs_merged_per_repo=merged_per_repo,
+        active_contributors=active.active_contributors,
+        recent_activity=recent,
+    )
 
 
 # PUBLIC_INTERFACE
