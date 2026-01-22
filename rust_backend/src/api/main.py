@@ -4,9 +4,11 @@ from sqlalchemy import text
 from sqlalchemy.orm import Session
 
 from src.api.db import get_db_session, init_engine
+from src.api.oauth_routes import router as oauth_router
 
 openapi_tags = [
     {"name": "Health", "description": "Service and database health checks."},
+    {"name": "Auth", "description": "OAuth login flows for GitHub/GitLab/Bitbucket."},
 ]
 
 app = FastAPI(
@@ -23,6 +25,9 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+# OAuth routes
+app.include_router(oauth_router)
 
 
 @app.on_event("startup")
