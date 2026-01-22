@@ -176,3 +176,57 @@ class GitEvent(Base):
     metadata: Mapped[Optional[Dict[str, Any]]] = mapped_column(JSONB, nullable=True)
 
     repo: Mapped[Repo] = relationship("Repo", back_populates="git_events")
+
+
+class AnalyticsDevDaily(Base):
+    """ORM mapping for `analytics_dev_daily` table (per-developer daily rollups)."""
+
+    __tablename__ = "analytics_dev_daily"
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+
+    org_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), ForeignKey("orgs.id", ondelete="CASCADE"), nullable=False)
+    repo_id: Mapped[Optional[uuid.UUID]] = mapped_column(UUID(as_uuid=True), ForeignKey("repos.id", ondelete="CASCADE"), nullable=True)
+
+    # Store as date (SQLAlchemy Date works well with Postgres DATE)
+    from sqlalchemy import Date  # local import to avoid reordering existing imports
+
+    day: Mapped[Any] = mapped_column(Date, nullable=False)
+
+    actor_provider_user_id: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    actor_username: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    actor_email: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+
+    commits_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    prs_opened_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    prs_merged_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    merges_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+
+    lines_added: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    lines_deleted: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, server_default=func.now())
+
+
+class AnalyticsRepoDaily(Base):
+    """ORM mapping for `analytics_repo_daily` table (per-repo daily rollups)."""
+
+    __tablename__ = "analytics_repo_daily"
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+
+    org_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), ForeignKey("orgs.id", ondelete="CASCADE"), nullable=False)
+    repo_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), ForeignKey("repos.id", ondelete="CASCADE"), nullable=False)
+
+    from sqlalchemy import Date  # local import to avoid reordering existing imports
+
+    day: Mapped[Any] = mapped_column(Date, nullable=False)
+
+    commits_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    prs_opened_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    prs_merged_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    merges_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+
+    active_devs_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, server_default=func.now())
