@@ -26,13 +26,13 @@ def get_database_url() -> str:
       2) Preview/default local dev connection string.
 
     Note:
-      - The work item preview lists Postgres on port 5001, but the canonical
-        db_connection.txt currently points to port 5000. We follow the request
-        and default to 5001 here, while still allowing override via DATABASE_URL.
+      - The canonical postgresql_db/db_connection.txt in this repo points to port 5000.
+        We default to that value for local/dev smoke tests, while still allowing override
+        via DATABASE_URL for other environments.
     """
     return os.getenv(
         "DATABASE_URL",
-        "postgresql+psycopg://appuser:dbuser123@localhost:5001/myapp",
+        "postgresql+psycopg://appuser:dbuser123@localhost:5000/myapp",
     )
 
 
