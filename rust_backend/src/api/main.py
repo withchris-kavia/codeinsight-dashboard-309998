@@ -3,6 +3,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy import text
 from sqlalchemy.orm import Session
 
+from src.api.ai_routes import router as ai_router
 from src.api.analytics_routes import router as analytics_router
 from src.api.db import get_db_session, init_engine
 from src.api.oauth_routes import router as oauth_router
@@ -13,6 +14,7 @@ openapi_tags = [
     {"name": "Auth", "description": "OAuth login flows for GitHub/GitLab/Bitbucket."},
     {"name": "Webhooks", "description": "Provider webhook ingestion endpoints (GitHub/GitLab/Bitbucket)."},
     {"name": "Analytics", "description": "On-demand analytics aggregation and dashboard endpoints."},
+    {"name": "AI", "description": "AI summary generation and retrieval endpoints."},
 ]
 
 app = FastAPI(
@@ -38,6 +40,9 @@ app.include_router(webhook_router)
 
 # Analytics routes
 app.include_router(analytics_router)
+
+# AI summary routes
+app.include_router(ai_router)
 
 
 @app.on_event("startup")

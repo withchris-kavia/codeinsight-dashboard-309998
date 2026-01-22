@@ -22,14 +22,16 @@ This keeps ingestion functional even before an explicit "connect org/repo" UI ex
 from __future__ import annotations
 
 import uuid
-from datetime import datetime
+from datetime import date, datetime
 from typing import Any, Dict, List, Optional
 
 from sqlalchemy import (
     Boolean,
+    Date,
     DateTime,
     ForeignKey,
     Integer,
+    Numeric,
     String,
     Text,
     func,
@@ -230,3 +232,42 @@ class AnalyticsRepoDaily(Base):
     active_devs_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
 
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, server_default=func.now())
+
+
+class AiSummary(Base):
+    """ORM mapping for persisted AI-generated summaries.
+
+    Notes:
+      - The DB schema may be created by a separate DB container migration.
+      - The API router also ensures the table exists at runtime (CREATE TABLE IF NOT EXISTS),
+        so local/dev previews keep working even when migrations lag.
+    """
+
+    __tablename__ = "ai_summaries"
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+
+    # Nullable scope pointers (requested fields)
+    repo_id: Mapped[Optional[uuid.UUID]] = mapped_column(UUID(as_uuid=True), nullable=True)
+    org_id: Mapped[Optional[uuid.UUID]] = mapped_column(UUID(as_uuid=True), nullable=True)
+
+    subject_type: Mapped[str] = mapped_column(
+        Text,
+        nullable=False,
+        doc="One of: repo|org|user|system",
+    )
+    subject_id: Mapped[Optional[uuid.UUID]] = mapped_column(UUID(as_uuid=True), nullable=True)
+
+    period_start: Mapped[date] = mapped_column(Date, nullable=False)
+    period_end: Mapped[date] = mapped_column(Date, nullable=False)
+
+    summary_text: Mapped[str] = mapped_column(Text, nullable=False)
+
+    provider: Mapped[str] = mapped_column(Text, nullable=False, default="openai")
+    model: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+
+    tokens_in: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+    tokens_out: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+    cost_usd: Mapped[Optional[float]] = mapped_column(Numeric(12, 6), nullable=True)
+
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, server_default=func.now())
