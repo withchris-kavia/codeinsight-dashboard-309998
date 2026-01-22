@@ -4,20 +4,57 @@ SQLAlchemy ORM models for the CodeInsight Dashboard backend.
 These models map to tables created by the PostgreSQL schema in
 `postgresql_db/schema/001_init_schema.sql`.
 
-We only define fields needed for OAuth token persistence and minimal user linkage.
+We include:
+- Orgs / Users (minimal)
+- OAuth identities (for login flows)
+- Repos + GitEvents (for webhook ingestion)
+
+Design notes:
+- The webhook ingestion needs `org_id` and `repo_id` for `git_events` (NOT NULL in schema).
+  When a webhook arrives for a repo we have not seen before, we create:
+  - a default Org (slug=default) if one does not exist, then
+  - the Repo row in that org, then
+  - GitEvent rows linked to that repo.
+
+This keeps ingestion functional even before an explicit "connect org/repo" UI exists.
 """
 
 from __future__ import annotations
 
 import uuid
 from datetime import datetime
-from typing import List, Optional
+from typing import Any, Dict, List, Optional
 
-from sqlalchemy import DateTime, ForeignKey, String, Text, func
-from sqlalchemy.dialects.postgresql import ARRAY, UUID
+from sqlalchemy import (
+    Boolean,
+    DateTime,
+    ForeignKey,
+    Integer,
+    String,
+    Text,
+    func,
+)
+from sqlalchemy.dialects.postgresql import ARRAY, JSONB, UUID
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from src.api.db import Base
+
+
+class Org(Base):
+    """ORM mapping for `orgs` table."""
+
+    __tablename__ = "orgs"
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    slug: Mapped[str] = mapped_column(Text, nullable=False, unique=True)
+    name: Mapped[str] = mapped_column(Text, nullable=False)
+    plan_tier: Mapped[str] = mapped_column(Text, nullable=False, default="free")
+
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, server_default=func.now())
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, server_default=func.now())
+
+    users: Mapped[List["User"]] = relationship("User", back_populates="org")
+    repos: Mapped[List["Repo"]] = relationship("Repo", back_populates="org")
 
 
 class User(Base):
@@ -27,8 +64,7 @@ class User(Base):
 
     id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
 
-    # Note: org_id exists in schema but is not required for OAuth persistence.
-    org_id: Mapped[Optional[uuid.UUID]] = mapped_column(UUID(as_uuid=True), nullable=True)
+    org_id: Mapped[Optional[uuid.UUID]] = mapped_column(UUID(as_uuid=True), ForeignKey("orgs.id"), nullable=True)
 
     email: Mapped[Optional[str]] = mapped_column(Text, nullable=True, unique=True)
     display_name: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
@@ -39,6 +75,8 @@ class User(Base):
 
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, server_default=func.now())
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, server_default=func.now())
+
+    org: Mapped[Optional[Org]] = relationship("Org", back_populates="users")
 
     oauth_identities: Mapped[List["OAuthIdentity"]] = relationship(
         "OAuthIdentity",
@@ -74,3 +112,67 @@ class OAuthIdentity(Base):
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, server_default=func.now())
 
     user: Mapped[User] = relationship("User", back_populates="oauth_identities")
+
+
+class Repo(Base):
+    """ORM mapping for `repos` table."""
+
+    __tablename__ = "repos"
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+
+    org_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), ForeignKey("orgs.id", ondelete="CASCADE"), nullable=False)
+
+    provider: Mapped[str] = mapped_column(Text, nullable=False)  # github|gitlab|bitbucket
+    external_id: Mapped[str] = mapped_column(Text, nullable=False)  # provider repo id
+    owner: Mapped[str] = mapped_column(Text, nullable=False)
+    name: Mapped[str] = mapped_column(Text, nullable=False)
+    full_name: Mapped[str] = mapped_column(Text, nullable=False)  # owner/name
+    default_branch: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+
+    is_private: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
+    is_active: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
+
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, server_default=func.now())
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, server_default=func.now())
+
+    org: Mapped[Org] = relationship("Org", back_populates="repos")
+    git_events: Mapped[List["GitEvent"]] = relationship("GitEvent", back_populates="repo")
+
+
+class GitEvent(Base):
+    """ORM mapping for `git_events` table (normalized event records)."""
+
+    __tablename__ = "git_events"
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+
+    org_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), ForeignKey("orgs.id", ondelete="CASCADE"), nullable=False)
+    repo_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), ForeignKey("repos.id", ondelete="CASCADE"), nullable=False)
+
+    provider: Mapped[str] = mapped_column(Text, nullable=False)
+    event_type: Mapped[str] = mapped_column(Text, nullable=False)  # commit | pull_request | merge | ...
+    external_event_id: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+
+    actor_provider_user_id: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    actor_username: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    actor_email: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+
+    event_timestamp: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    ingested_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, server_default=func.now())
+
+    ref: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    base_ref: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    head_ref: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    commit_sha: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    merge_commit_sha: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+
+    pr_number: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+    pr_title: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    pr_state: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    pr_url: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+
+    raw_payload: Mapped[Optional[Dict[str, Any]]] = mapped_column(JSONB, nullable=True)
+    metadata: Mapped[Optional[Dict[str, Any]]] = mapped_column(JSONB, nullable=True)
+
+    repo: Mapped[Repo] = relationship("Repo", back_populates="git_events")
