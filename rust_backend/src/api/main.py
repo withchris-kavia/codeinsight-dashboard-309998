@@ -1,3 +1,6 @@
+import os
+from typing import List
+
 from fastapi import Depends, FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy import text
@@ -6,9 +9,9 @@ from sqlalchemy.orm import Session
 from src.api.ai_routes import router as ai_router
 from src.api.analytics_routes import router as analytics_router
 from src.api.db import get_db_session, init_engine
+from src.api.notifications_routes import router as notifications_router
 from src.api.oauth_routes import router as oauth_router
 from src.api.webhook_routes import router as webhook_router
-from src.api.notifications_routes import router as notifications_router
 
 openapi_tags = [
     {"name": "Health", "description": "Service and database health checks."},
@@ -19,6 +22,41 @@ openapi_tags = [
     {"name": "Notifications", "description": "Notification configuration and dispatch endpoints (Slack/email)."},
 ]
 
+
+def _split_csv_env(name: str) -> List[str]:
+    """Split an env var by commas, trimming whitespace, and dropping empty items."""
+    raw = os.getenv(name, "") or ""
+    return [item.strip() for item in raw.split(",") if item and item.strip()]
+
+
+# PUBLIC_INTERFACE
+def get_allowed_cors_origins() -> List[str]:
+    """
+    Compute allowed CORS origins for the API.
+
+    Defaults are aligned to local Next.js preview on port 3000.
+    You can override/extend via:
+      - FRONTEND_ORIGINS="http://localhost:3000,https://<your-preview-host>:3000"
+    """
+    env_origins = _split_csv_env("FRONTEND_ORIGINS")
+
+    # Default Next.js preview origins (per task instruction).
+    defaults = [
+        "http://localhost:3000",
+        "http://127.0.0.1:3000",
+    ]
+
+    # Preserve order while de-duplicating.
+    seen = set()
+    merged: List[str] = []
+    for o in [*env_origins, *defaults]:
+        if o not in seen:
+            merged.append(o)
+            seen.add(o)
+
+    return merged
+
+
 app = FastAPI(
     title="CodeInsight Dashboard API",
     description="Backend API for the CodeInsight dashboard (Git analytics + AI summaries).",
@@ -26,11 +64,16 @@ app = FastAPI(
     openapi_tags=openapi_tags,
 )
 
+# NOTE:
+# - With allow_credentials=True, allow_origins cannot be ["*"].
+# - We also allow any https? origin *ending in :3000* via regex to support preview URLs
+#   (while staying aligned with the preview port requirement).
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=get_allowed_cors_origins(),
+    allow_origin_regex=r"^https?://.*:3000$",
     allow_credentials=True,
-    allow_methods=["*"],
+    allow_methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
     allow_headers=["*"],
 )
 
