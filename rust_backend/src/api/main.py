@@ -35,10 +35,16 @@ def get_allowed_cors_origins() -> List[str]:
     Compute allowed CORS origins for the API.
 
     Defaults are aligned to local Next.js preview on port 3000.
-    You can override/extend via:
-      - FRONTEND_ORIGINS="http://localhost:3000,https://<your-preview-host>:3000"
+
+    You can override/extend via either:
+      - FRONTEND_ORIGIN="https://preview-host:3000"               (single origin)
+      - FRONTEND_ORIGINS="http://localhost:3000,https://...:3000" (comma-separated)
+
+    Note:
+      - With allow_credentials=True, you cannot use "*" for allow_origins.
     """
-    env_origins = _split_csv_env("FRONTEND_ORIGINS")
+    env_origin_single = (os.getenv("FRONTEND_ORIGIN") or "").strip()
+    env_origins_csv = _split_csv_env("FRONTEND_ORIGINS")
 
     # Default Next.js preview origins (per task instruction).
     defaults = [
@@ -49,7 +55,9 @@ def get_allowed_cors_origins() -> List[str]:
     # Preserve order while de-duplicating.
     seen = set()
     merged: List[str] = []
-    for o in [*env_origins, *defaults]:
+    for o in [env_origin_single, *env_origins_csv, *defaults]:
+        if not o:
+            continue
         if o not in seen:
             merged.append(o)
             seen.add(o)
@@ -68,10 +76,13 @@ app = FastAPI(
 # - With allow_credentials=True, allow_origins cannot be ["*"].
 # - We also allow any https? origin *ending in :3000* via regex to support preview URLs
 #   (while staying aligned with the preview port requirement).
+# - Optionally override the regex via FRONTEND_ORIGIN_REGEX if your preview runs on a different port.
+cors_origin_regex = os.getenv("FRONTEND_ORIGIN_REGEX", r"^https?://.*:3000$")
+
 app.add_middleware(
     CORSMiddleware,
     allow_origins=get_allowed_cors_origins(),
-    allow_origin_regex=r"^https?://.*:3000$",
+    allow_origin_regex=cors_origin_regex,
     allow_credentials=True,
     allow_methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
     allow_headers=["*"],
