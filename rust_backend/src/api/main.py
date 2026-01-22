@@ -1,7 +1,20 @@
-from fastapi import FastAPI
+from fastapi import Depends, FastAPI
 from fastapi.middleware.cors import CORSMiddleware
+from sqlalchemy import text
+from sqlalchemy.orm import Session
 
-app = FastAPI()
+from src.api.db import get_db_session, init_engine
+
+openapi_tags = [
+    {"name": "Health", "description": "Service and database health checks."},
+]
+
+app = FastAPI(
+    title="CodeInsight Dashboard API",
+    description="Backend API for the CodeInsight dashboard (Git analytics + AI summaries).",
+    version="0.1.0",
+    openapi_tags=openapi_tags,
+)
 
 app.add_middleware(
     CORSMiddleware,
@@ -11,6 +24,42 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-@app.get("/")
+
+@app.on_event("startup")
+def _startup_init_db() -> None:
+    """Initialize DB engine early so connection issues surface on startup logs."""
+    init_engine()
+
+
+@app.get(
+    "/",
+    tags=["Health"],
+    summary="Health check (legacy)",
+    description="Legacy health check endpoint. Prefer GET /health.",
+)
+def health_check_root():
+    """Health check endpoint (legacy root path)."""
+    return {"status": "ok", "message": "Healthy"}
+
+
+@app.get(
+    "/health",
+    tags=["Health"],
+    summary="Health check",
+    description="Returns OK if the API process is running.",
+)
 def health_check():
-    return {"message": "Healthy"}
+    """Health check endpoint."""
+    return {"status": "ok"}
+
+
+@app.get(
+    "/db/health",
+    tags=["Health"],
+    summary="Database health check",
+    description="Runs a trivial SELECT 1 query to verify database connectivity.",
+)
+def db_health_check(db: Session = Depends(get_db_session)):
+    """Database connectivity check using SELECT 1."""
+    db.execute(text("SELECT 1"))
+    return {"status": "ok", "db": "reachable"}
