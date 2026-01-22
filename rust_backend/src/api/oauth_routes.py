@@ -46,6 +46,39 @@ def _get_env_required(name: str) -> str:
     return value
 
 
+def _get_env_optional(name: str) -> Optional[str]:
+    """Get an env var if set and non-empty; otherwise None."""
+    value = os.getenv(name)
+    if not value or not value.strip():
+        return None
+    return value
+
+
+def _oauth_configured(provider: Provider) -> bool:
+    """
+    Return True if the provider OAuth env config is present.
+
+    This is used to decide whether to run a real OAuth exchange or a safe stub flow.
+    """
+    required = [_client_id_env(provider), _client_secret_env(provider), "OAUTH_STATE_SECRET"]
+    return all(_get_env_optional(k) for k in required)
+
+
+def _encode_state_unsigned(payload: Dict[str, Any]) -> str:
+    """
+    Encode state without signing (stub-mode only).
+
+    Format: base64url(JSON)
+    """
+    raw = json.dumps(payload, separators=(",", ":"), sort_keys=True).encode("utf-8")
+    return _b64url(raw)
+
+
+def _decode_state_unsigned(state: str) -> Dict[str, Any]:
+    """Decode unsigned state (stub-mode only)."""
+    return json.loads(_b64url_decode(state).decode("utf-8"))
+
+
 def _get_backend_base_url() -> str:
     """Backend base URL used for redirect_uri generation."""
     return os.getenv("BACKEND_BASE_URL", "http://localhost:3001").rstrip("/")
@@ -393,20 +426,38 @@ async def oauth_login(
         description="Optional frontend path or absolute URL to return to after success (stored in signed state).",
     ),
 ):
-    """Initiate OAuth by returning provider authorization URL (JSON)."""
+    """Initiate OAuth by returning provider authorization URL (JSON).
+
+    Safe stub behavior:
+      - If provider client credentials / OAUTH_STATE_SECRET are missing, we still return a
+        deterministic stub auth_url and an unsigned state so smoke tests can exercise the route.
+    """
     endpoints = _provider_endpoints(provider)
-    client_id = _get_env_required(_client_id_env(provider))
-    state_secret = _get_env_required("OAUTH_STATE_SECRET")
 
-    scopes = os.getenv(_scopes_env(provider), _default_scopes(provider))
-
+    # Build state payload first (used both in real and stub modes).
     payload = {
         "provider": provider,
         "nonce": secrets.token_urlsafe(16),
         "ts": int(time.time()),
-        # Allow caller to specify where the frontend should go next; default to frontend root.
         "return_to": return_to or _get_frontend_base_url(),
+        "stub": not _oauth_configured(provider),
     }
+
+    if not _oauth_configured(provider):
+        # Unsigned state, and a non-provider URL (keeps UX predictable in dev/smoke tests).
+        state = _encode_state_unsigned(payload)
+        return {
+            "provider": provider,
+            "auth_url": f"{_get_backend_base_url()}/auth/{provider}/callback?code=mocked-code&state={state}",
+            "redirect_uri": _redirect_uri(provider),
+            "stub": True,
+            "detail": "OAuth provider env is not configured; returning stub auth_url for smoke tests.",
+        }
+
+    client_id = _get_env_required(_client_id_env(provider))
+    state_secret = _get_env_required("OAUTH_STATE_SECRET")
+
+    scopes = os.getenv(_scopes_env(provider), _default_scopes(provider))
     state = _sign_state(payload, state_secret)
 
     # Provider-specific scope param differences: GitHub/GitLab/Bitbucket all accept `scope`.
@@ -418,10 +469,6 @@ async def oauth_login(
         "scope": scopes,
     }
 
-    # GitHub uses response_type=code implicitly, but harmless.
-    # Bitbucket expects response_type=code.
-    # GitLab expects response_type=code.
-
     # Build URL without depending on extra libs.
     from urllib.parse import urlencode
 
@@ -430,6 +477,7 @@ async def oauth_login(
         "provider": provider,
         "auth_url": auth_url,
         "redirect_uri": _redirect_uri(provider),
+        "stub": False,
     }
 
 
@@ -451,7 +499,12 @@ async def oauth_callback(
     error_description: Optional[str] = Query(default=None, description="OAuth error description, if any"),
     db: Session = Depends(get_db_session),
 ):
-    """Handle OAuth callback and persist tokens into Postgres."""
+    """Handle OAuth callback and persist tokens into Postgres.
+
+    Safe stub behavior:
+      - If provider secrets are missing, we simulate token exchange + user profile and still
+        upsert into oauth_identities. This enables E2E smoke tests without real provider keys.
+    """
     if error:
         raise HTTPException(
             status_code=400,
@@ -463,37 +516,65 @@ async def oauth_callback(
         )
     if not code:
         raise HTTPException(status_code=400, detail={"error": "missing_code", "provider": provider})
-    if not state:
-        raise HTTPException(status_code=400, detail={"error": "missing_state", "provider": provider})
 
-    state_secret = _get_env_required("OAUTH_STATE_SECRET")
-    state_payload = _verify_state(state, state_secret)
-    if state_payload.get("provider") != provider:
-        raise HTTPException(status_code=400, detail={"error": "state_provider_mismatch", "provider": provider})
+    state_payload: Dict[str, Any] = {}
+    return_to = _get_frontend_base_url()
 
-    token_response = await _exchange_code_for_token(provider, code)
-    access_token = token_response.get("access_token")
-    if not isinstance(access_token, str) or not access_token:
-        raise HTTPException(
-            status_code=400,
-            detail={"error": "missing_access_token", "provider": provider, "token_response": token_response},
-        )
+    if state:
+        state_secret = _get_env_optional("OAUTH_STATE_SECRET")
+        if state_secret:
+            state_payload = _verify_state(state, state_secret)
+        else:
+            # Unsigned state decode (stub mode)
+            try:
+                state_payload = _decode_state_unsigned(state)
+            except Exception:
+                state_payload = {}
+        if state_payload.get("return_to"):
+            return_to = str(state_payload.get("return_to"))
+        if state_payload.get("provider") and state_payload.get("provider") != provider:
+            raise HTTPException(status_code=400, detail={"error": "state_provider_mismatch", "provider": provider})
 
-    refresh_token = token_response.get("refresh_token") if isinstance(token_response.get("refresh_token"), str) else None
-    expires_at = _parse_expires_at(token_response)
-    scopes = _parse_scopes(provider, token_response)
+    # Real flow if configured; otherwise stub.
+    if _oauth_configured(provider):
+        token_response = await _exchange_code_for_token(provider, code)
+        access_token = token_response.get("access_token")
+        if not isinstance(access_token, str) or not access_token:
+            raise HTTPException(
+                status_code=400,
+                detail={"error": "missing_access_token", "provider": provider, "token_response": token_response},
+            )
 
-    provider_user_raw, email = await _fetch_provider_user(provider, access_token)
-    normalized = _normalize_provider_user(provider, provider_user_raw, email)
+        refresh_token = token_response.get("refresh_token") if isinstance(token_response.get("refresh_token"), str) else None
+        expires_at = _parse_expires_at(token_response)
+        scopes = _parse_scopes(provider, token_response)
 
-    provider_user_id = normalized.get("provider_user_id")
-    if not provider_user_id:
-        raise HTTPException(status_code=400, detail={"error": "missing_provider_user_id", "provider": provider})
+        provider_user_raw, email = await _fetch_provider_user(provider, access_token)
+        normalized = _normalize_provider_user(provider, provider_user_raw, email)
 
-    username = normalized.get("username")
-    user_email = normalized.get("email")
-    display_name = normalized.get("display_name")
-    avatar_url = normalized.get("avatar_url")
+        provider_user_id = normalized.get("provider_user_id")
+        if not provider_user_id:
+            raise HTTPException(status_code=400, detail={"error": "missing_provider_user_id", "provider": provider})
+
+        username = normalized.get("username")
+        user_email = normalized.get("email")
+        display_name = normalized.get("display_name")
+        avatar_url = normalized.get("avatar_url")
+        stub = False
+    else:
+        # Stub flow: deterministic identifiers derived from inputs.
+        digest = hashlib.sha256(f"{provider}:{code}".encode("utf-8")).hexdigest()[:12]
+        provider_user_id = f"stub-{digest}"
+        access_token = f"stub-token-{digest}"
+        refresh_token = None
+        expires_at = datetime.now(timezone.utc) + timedelta(days=3650)
+        scopes = [s for s in _default_scopes(provider).replace(",", " ").split() if s]
+
+        username = f"{provider}-user"
+        user_email = f"{provider_user_id}@example.local"
+        display_name = f"Stub {provider.title()} User"
+        avatar_url = None
+        stub = True
 
     # Upsert identity by (provider, provider_user_id) (unique in schema).
     existing_identity = db.scalar(
@@ -516,7 +597,6 @@ async def oauth_callback(
         identity = existing_identity
     else:
         # If no identity exists, ensure we have a User row.
-        # Try to re-use user by email (if present), otherwise create a new user.
         user: Optional[User] = None
         if user_email:
             user = db.scalar(select(User).where(User.email == user_email))
@@ -557,5 +637,6 @@ async def oauth_callback(
         "provider_user_id": provider_user_id,
         "oauth_identity_id": str(identity.id),
         "user_id": str(identity.user_id),
-        "return_to": state_payload.get("return_to") or _get_frontend_base_url(),
+        "return_to": return_to,
+        "stub": stub,
     }

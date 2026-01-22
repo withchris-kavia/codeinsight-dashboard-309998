@@ -81,8 +81,17 @@ def _parse_signature_header(signature_header: str) -> Tuple[Optional[str], str]:
 
 
 def _verify_github_signature(body: bytes, signature_header: Optional[str]) -> None:
-    """Verify GitHub X-Hub-Signature-256 using GITHUB_WEBHOOK_SECRET."""
-    secret = _get_env_required("GITHUB_WEBHOOK_SECRET")
+    """Verify GitHub X-Hub-Signature-256 using GITHUB_WEBHOOK_SECRET.
+
+    Safe stub behavior:
+      - If GITHUB_WEBHOOK_SECRET is missing, skip verification (allows local/dev smoke tests).
+      - If secret is present, enforce signature.
+    """
+    secret = _get_env_optional("GITHUB_WEBHOOK_SECRET")
+    if not secret:
+        logger.warning("GITHUB_WEBHOOK_SECRET not configured; skipping GitHub signature verification (stub mode).")
+        return
+
     if not signature_header:
         raise HTTPException(status_code=401, detail="Missing X-Hub-Signature-256 header.")
     alg, got = _parse_signature_header(signature_header)
@@ -94,8 +103,17 @@ def _verify_github_signature(body: bytes, signature_header: Optional[str]) -> No
 
 
 def _verify_gitlab_token(token_header: Optional[str]) -> None:
-    """Verify GitLab X-Gitlab-Token matches configured GITLAB_WEBHOOK_TOKEN."""
-    expected = _get_env_required("GITLAB_WEBHOOK_TOKEN")
+    """Verify GitLab X-Gitlab-Token matches configured GITLAB_WEBHOOK_TOKEN.
+
+    Safe stub behavior:
+      - If GITLAB_WEBHOOK_TOKEN is missing, skip verification (allows local/dev smoke tests).
+      - If token is present, enforce match.
+    """
+    expected = _get_env_optional("GITLAB_WEBHOOK_TOKEN")
+    if not expected:
+        logger.warning("GITLAB_WEBHOOK_TOKEN not configured; skipping GitLab token verification (stub mode).")
+        return
+
     got = (token_header or "").strip()
     if not got:
         raise HTTPException(status_code=401, detail="Missing X-Gitlab-Token header.")

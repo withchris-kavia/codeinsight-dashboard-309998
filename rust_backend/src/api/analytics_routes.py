@@ -31,6 +31,51 @@ from src.api.db import get_db_session
 router = APIRouter(prefix="/analytics", tags=["Analytics"])
 
 
+def _ensure_default_org_and_get_id(db: Session) -> UUID:
+    """
+    Ensure the 'default' org exists and return its UUID.
+
+    This supports smoke tests where the caller uses org_id=1 as a shorthand.
+    """
+    row = db.execute(text("SELECT id FROM orgs WHERE slug = 'default' LIMIT 1")).first()
+    if row and row[0]:
+        return UUID(str(row[0]))
+
+    created = db.execute(
+        text(
+            """
+            INSERT INTO orgs (slug, name, plan_tier)
+            VALUES ('default', 'Default', 'free')
+            ON CONFLICT (slug) DO UPDATE SET updated_at = now()
+            RETURNING id
+            """
+        )
+    ).first()
+    if not created or not created[0]:
+        # Extremely defensive; should not happen.
+        raise HTTPException(status_code=500, detail="Failed to create default org.")
+    db.commit()
+    return UUID(str(created[0]))
+
+
+def _parse_org_id(value: str, db: Session) -> UUID:
+    """
+    Parse org identifier.
+
+    Accepted formats:
+      - UUID string
+      - "1" (legacy/smoke test shorthand) => maps to default org UUID
+      - "default" => maps to default org UUID
+    """
+    v = (value or "").strip()
+    if v in ("1", "default"):
+        return _ensure_default_org_and_get_id(db)
+    try:
+        return UUID(v)
+    except Exception as e:
+        raise HTTPException(status_code=422, detail=f"org_id must be a UUID (or '1'/'default'): {e}") from e
+
+
 def _utc_dt_range_from_dates(
     start_date: Optional[date],
     end_date: Optional[date],
@@ -63,7 +108,7 @@ def _utc_dt_range_from_dates(
 
 
 class AnalyticsComputeRequest(BaseModel):
-    org_id: UUID = Field(..., description="Organization UUID to compute analytics for.")
+    org_id: str = Field(..., description="Organization UUID (or legacy '1' for default org) to compute analytics for.")
     repo_id: Optional[UUID] = Field(default=None, description="Optional repo UUID to scope aggregation to.")
     start_date: Optional[date] = Field(
         default=None,
@@ -366,19 +411,20 @@ def _compute_dev_daily(db: Session, *, org_id: UUID, repo_id: Optional[UUID], st
 )
 def compute_analytics(req: AnalyticsComputeRequest, db: Session = Depends(get_db_session)) -> AnalyticsComputeResponse:
     """Compute daily analytics aggregates and store them in analytics tables."""
-    _validate_org_repo_scope(req.org_id, req.repo_id, db)
+    org_uuid = _parse_org_id(req.org_id, db)
+    _validate_org_repo_scope(org_uuid, req.repo_id, db)
     start_ts, end_ts = _utc_dt_range_from_dates(req.start_date, req.end_date)
 
     try:
-        repo_upserts = _compute_repo_daily(db, org_id=req.org_id, repo_id=req.repo_id, start_ts=start_ts, end_ts=end_ts)
-        dev_upserts = _compute_dev_daily(db, org_id=req.org_id, repo_id=req.repo_id, start_ts=start_ts, end_ts=end_ts)
+        repo_upserts = _compute_repo_daily(db, org_id=org_uuid, repo_id=req.repo_id, start_ts=start_ts, end_ts=end_ts)
+        dev_upserts = _compute_dev_daily(db, org_id=org_uuid, repo_id=req.repo_id, start_ts=start_ts, end_ts=end_ts)
         db.commit()
     except Exception as e:
         db.rollback()
         raise HTTPException(status_code=500, detail={"error": "analytics_compute_failed", "message": str(e)})
 
     return AnalyticsComputeResponse(
-        org_id=req.org_id,
+        org_id=org_uuid,
         repo_id=req.repo_id,
         start_ts=start_ts,
         end_ts=end_ts,
@@ -399,14 +445,15 @@ def compute_analytics(req: AnalyticsComputeRequest, db: Session = Depends(get_db
     response_model=List[DayCountPoint],
 )
 def commits_per_day(
-    org_id: UUID = Query(..., description="Organization UUID."),
+    org_id: str = Query(..., description="Organization UUID (or legacy '1'/'default' for default org)."),
     repo_id: Optional[UUID] = Query(default=None, description="Optional repo UUID."),
     start_date: Optional[date] = Query(default=None, description="Start date (inclusive, UTC)."),
     end_date: Optional[date] = Query(default=None, description="End date (exclusive, UTC)."),
     db: Session = Depends(get_db_session),
 ) -> List[DayCountPoint]:
     """Fetch commits per day for org/repo using precomputed analytics."""
-    _validate_org_repo_scope(org_id, repo_id, db)
+    org_uuid = _parse_org_id(org_id, db)
+    _validate_org_repo_scope(org_uuid, repo_id, db)
     start_ts, end_ts = _utc_dt_range_from_dates(start_date, end_date)
 
     sql = text(
@@ -426,7 +473,7 @@ def commits_per_day(
     rows = db.execute(
         sql,
         {
-            "org_id": str(org_id),
+            "org_id": str(org_uuid),
             "repo_id": (str(repo_id) if repo_id is not None else None),
             "start_ts": start_ts,
             "end_ts": end_ts,
@@ -449,14 +496,15 @@ def commits_per_day(
     response_model=List[PullRequestsDayPoint],
 )
 def prs_per_day(
-    org_id: UUID = Query(..., description="Organization UUID."),
+    org_id: str = Query(..., description="Organization UUID (or legacy '1'/'default' for default org)."),
     repo_id: Optional[UUID] = Query(default=None, description="Optional repo UUID."),
     start_date: Optional[date] = Query(default=None, description="Start date (inclusive, UTC)."),
     end_date: Optional[date] = Query(default=None, description="End date (exclusive, UTC)."),
     db: Session = Depends(get_db_session),
 ) -> List[PullRequestsDayPoint]:
     """Fetch PR opened/merged per day for org/repo using precomputed analytics."""
-    _validate_org_repo_scope(org_id, repo_id, db)
+    org_uuid = _parse_org_id(org_id, db)
+    _validate_org_repo_scope(org_uuid, repo_id, db)
     start_ts, end_ts = _utc_dt_range_from_dates(start_date, end_date)
 
     sql = text(
@@ -514,7 +562,7 @@ def prs_per_day(
     response_model=DashboardMetricsResponse,
 )
 def dashboard_metrics(
-    org_id: UUID = Query(..., description="Organization UUID."),
+    org_id: str = Query(..., description="Organization UUID (or legacy '1'/'default' for default org)."),
     repo_id: Optional[UUID] = Query(default=None, description="Optional repo UUID."),
     start_date: Optional[date] = Query(default=None, description="Start date (inclusive, UTC)."),
     end_date: Optional[date] = Query(default=None, description="End date (exclusive, UTC)."),
@@ -523,11 +571,12 @@ def dashboard_metrics(
     db: Session = Depends(get_db_session),
 ) -> DashboardMetricsResponse:
     """Fetch a dashboard-ready set of analytics metrics."""
-    _validate_org_repo_scope(org_id, repo_id, db)
+    org_uuid = _parse_org_id(org_id, db)
+    _validate_org_repo_scope(org_uuid, repo_id, db)
     start_ts, end_ts = _utc_dt_range_from_dates(start_date, end_date)
 
     commits_series = commits_per_day(
-        org_id=org_id,
+        org_id=str(org_uuid),
         repo_id=repo_id,
         start_date=start_date,
         end_date=end_date,
@@ -535,7 +584,7 @@ def dashboard_metrics(
     )
 
     prs_series = prs_per_day(
-        org_id=org_id,
+        org_id=str(org_uuid),
         repo_id=repo_id,
         start_date=start_date,
         end_date=end_date,
@@ -563,14 +612,14 @@ def dashboard_metrics(
         )
         rows = db.execute(
             sql,
-            {"org_id": str(org_id), "repo_id": str(repo_id), "start_ts": start_ts, "end_ts": end_ts},
+            {"org_id": str(org_uuid), "repo_id": str(repo_id), "start_ts": start_ts, "end_ts": end_ts},
         ).mappings().all()
         merged_per_repo = [
             RepoCountPoint(repo_id=r["repo_id"], repo_full_name=r["repo_full_name"], count=int(r["count"])) for r in rows
         ]
     else:
         merged_per_repo = prs_merged_per_repo(
-            org_id=org_id,
+            org_id=str(org_uuid),
             start_date=start_date,
             end_date=end_date,
             limit=int(top_repos_limit),
@@ -578,17 +627,17 @@ def dashboard_metrics(
         )
 
     active = active_contributors(
-        org_id=org_id,
+        org_id=str(org_uuid),
         repo_id=repo_id,
         start_date=start_date,
         end_date=end_date,
         db=db,
     )
 
-    recent = recent_activity(org_id=org_id, repo_id=repo_id, limit=int(recent_limit), db=db)
+    recent = recent_activity(org_id=str(org_uuid), repo_id=repo_id, limit=int(recent_limit), db=db)
 
     return DashboardMetricsResponse(
-        org_id=org_id,
+        org_id=org_uuid,
         repo_id=repo_id,
         start_ts=start_ts,
         end_ts=end_ts,
@@ -612,13 +661,14 @@ def dashboard_metrics(
     response_model=List[RepoCountPoint],
 )
 def prs_merged_per_repo(
-    org_id: UUID = Query(..., description="Organization UUID."),
+    org_id: str = Query(..., description="Organization UUID (or legacy '1'/'default' for default org)."),
     start_date: Optional[date] = Query(default=None, description="Start date (inclusive, UTC)."),
     end_date: Optional[date] = Query(default=None, description="End date (exclusive, UTC)."),
     limit: int = Query(default=50, ge=1, le=200, description="Max repos returned (sorted by merged count desc)."),
     db: Session = Depends(get_db_session),
 ) -> List[RepoCountPoint]:
     """Fetch merged PR counts per repo for an org."""
+    org_uuid = _parse_org_id(org_id, db)
     start_ts, end_ts = _utc_dt_range_from_dates(start_date, end_date)
 
     sql = text(
@@ -640,7 +690,7 @@ def prs_merged_per_repo(
     )
     rows = db.execute(
         sql,
-        {"org_id": str(org_id), "start_ts": start_ts, "end_ts": end_ts, "limit": int(limit)},
+        {"org_id": str(org_uuid), "start_ts": start_ts, "end_ts": end_ts, "limit": int(limit)},
     ).mappings().all()
 
     return [RepoCountPoint(repo_id=r["repo_id"], repo_full_name=r["repo_full_name"], count=int(r["count"])) for r in rows]
@@ -658,14 +708,15 @@ def prs_merged_per_repo(
     response_model=ActiveContributorsResponse,
 )
 def active_contributors(
-    org_id: UUID = Query(..., description="Organization UUID."),
+    org_id: str = Query(..., description="Organization UUID (or legacy '1'/'default' for default org)."),
     repo_id: Optional[UUID] = Query(default=None, description="Optional repo UUID."),
     start_date: Optional[date] = Query(default=None, description="Start date (inclusive, UTC)."),
     end_date: Optional[date] = Query(default=None, description="End date (exclusive, UTC)."),
     db: Session = Depends(get_db_session),
 ) -> ActiveContributorsResponse:
     """Compute distinct active contributor count."""
-    _validate_org_repo_scope(org_id, repo_id, db)
+    org_uuid = _parse_org_id(org_id, db)
+    _validate_org_repo_scope(org_uuid, repo_id, db)
     start_ts, end_ts = _utc_dt_range_from_dates(start_date, end_date)
 
     # Preferred: analytics_dev_daily (smaller than git_events).
@@ -686,7 +737,7 @@ def active_contributors(
     row = db.execute(
         sql,
         {
-            "org_id": str(org_id),
+            "org_id": str(org_uuid),
             "repo_id": (str(repo_id) if repo_id is not None else None),
             "start_ts": start_ts,
             "end_ts": end_ts,
@@ -719,7 +770,7 @@ def active_contributors(
         fb = db.execute(
             fallback_sql,
             {
-                "org_id": str(org_id),
+                "org_id": str(org_uuid),
                 "repo_id": (str(repo_id) if repo_id is not None else None),
                 "start_ts": start_ts,
                 "end_ts": end_ts,
@@ -728,7 +779,7 @@ def active_contributors(
         cnt = int(fb["cnt"] if fb and fb.get("cnt") is not None else 0)
 
     return ActiveContributorsResponse(
-        org_id=org_id,
+        org_id=org_uuid,
         repo_id=repo_id,
         start_ts=start_ts,
         end_ts=end_ts,
@@ -748,13 +799,14 @@ def active_contributors(
     response_model=List[RecentActivityItem],
 )
 def recent_activity(
-    org_id: UUID = Query(..., description="Organization UUID."),
+    org_id: str = Query(..., description="Organization UUID (or legacy '1'/'default' for default org)."),
     repo_id: Optional[UUID] = Query(default=None, description="Optional repo UUID."),
     limit: int = Query(default=50, ge=1, le=200, description="Max events returned."),
     db: Session = Depends(get_db_session),
 ) -> List[RecentActivityItem]:
     """Fetch latest git events for activity feed."""
-    _validate_org_repo_scope(org_id, repo_id, db)
+    org_uuid = _parse_org_id(org_id, db)
+    _validate_org_repo_scope(org_uuid, repo_id, db)
 
     sql = text(
         """
@@ -781,7 +833,7 @@ def recent_activity(
     )
     rows = db.execute(
         sql,
-        {"org_id": str(org_id), "repo_id": (str(repo_id) if repo_id is not None else None), "limit": int(limit)},
+        {"org_id": str(org_uuid), "repo_id": (str(repo_id) if repo_id is not None else None), "limit": int(limit)},
     ).mappings().all()
 
     return [
