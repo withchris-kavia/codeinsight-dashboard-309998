@@ -271,3 +271,44 @@ class AiSummary(Base):
     cost_usd: Mapped[Optional[float]] = mapped_column(Numeric(12, 6), nullable=True)
 
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, server_default=func.now())
+
+
+class NotificationConfig(Base):
+    """ORM mapping for `notification_configs` table.
+
+    A config is scoped to either:
+      - an org (org_id set), or
+      - a user (user_id set), or
+      - both (org_id + user_id), depending on caller needs.
+
+    Provider-specific fields:
+      - provider=slack: uses slack_webhook_url (optional; can fall back to SLACK_WEBHOOK_DEFAULT env var)
+      - provider=email: uses email_address
+
+    Observability fields:
+      - last_dispatch_at, last_error
+    """
+
+    __tablename__ = "notification_configs"
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+
+    org_id: Mapped[Optional[uuid.UUID]] = mapped_column(UUID(as_uuid=True), nullable=True, index=True)
+    user_id: Mapped[Optional[uuid.UUID]] = mapped_column(UUID(as_uuid=True), nullable=True, index=True)
+
+    provider: Mapped[str] = mapped_column(Text, nullable=False)  # slack|email
+    enabled: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
+
+    slack_webhook_url: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    email_address: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+
+    last_dispatch_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+    last_error: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, server_default=func.now())
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        nullable=False,
+        server_default=func.now(),
+        onupdate=func.now(),
+    )

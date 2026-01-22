@@ -8,6 +8,7 @@ from src.api.analytics_routes import router as analytics_router
 from src.api.db import get_db_session, init_engine
 from src.api.oauth_routes import router as oauth_router
 from src.api.webhook_routes import router as webhook_router
+from src.api.notifications_routes import router as notifications_router
 
 openapi_tags = [
     {"name": "Health", "description": "Service and database health checks."},
@@ -15,6 +16,7 @@ openapi_tags = [
     {"name": "Webhooks", "description": "Provider webhook ingestion endpoints (GitHub/GitLab/Bitbucket)."},
     {"name": "Analytics", "description": "On-demand analytics aggregation and dashboard endpoints."},
     {"name": "AI", "description": "AI summary generation and retrieval endpoints."},
+    {"name": "Notifications", "description": "Notification configuration and dispatch endpoints (Slack/email)."},
 ]
 
 app = FastAPI(
@@ -43,6 +45,9 @@ app.include_router(analytics_router)
 
 # AI summary routes
 app.include_router(ai_router)
+
+# Notifications routes
+app.include_router(notifications_router)
 
 
 @app.on_event("startup")
