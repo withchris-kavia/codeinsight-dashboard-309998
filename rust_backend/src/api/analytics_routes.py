@@ -156,6 +156,10 @@ def _compute_repo_daily(db: Session, *, org_id: UUID, repo_id: Optional[UUID], s
 
     Note: PR merged counts are approximated using `merge` events (since ingestion normalizes
     merges into event_type='merge').
+
+    Important:
+      - SQLAlchemy/psycopg `rowcount` is not reliable for INSERT .. ON CONFLICT across drivers.
+      - We use `RETURNING 1` and count returned rows for a stable, deterministic upsert count.
     """
     sql = text(
         """
@@ -230,9 +234,10 @@ def _compute_repo_daily(db: Session, *, org_id: UUID, repo_id: Optional[UUID], s
           merges_count = EXCLUDED.merges_count,
           active_devs_count = EXCLUDED.active_devs_count,
           updated_at = now()
+        RETURNING 1
         """
     )
-    res = db.execute(
+    rows = db.execute(
         sql,
         {
             "org_id": str(org_id),
@@ -240,9 +245,8 @@ def _compute_repo_daily(db: Session, *, org_id: UUID, repo_id: Optional[UUID], s
             "start_ts": start_ts,
             "end_ts": end_ts,
         },
-    )
-    # rowcount on INSERT..ON CONFLICT is driver dependent; still useful for basic visibility
-    return int(res.rowcount or 0)
+    ).fetchall()
+    return int(len(rows))
 
 
 def _compute_dev_daily(db: Session, *, org_id: UUID, repo_id: Optional[UUID], start_ts: datetime, end_ts: datetime) -> int:
@@ -251,6 +255,10 @@ def _compute_dev_daily(db: Session, *, org_id: UUID, repo_id: Optional[UUID], st
 
     We only aggregate rows where at least one actor identifier is present, otherwise
     uniqueness/attribution becomes unreliable.
+
+    Important:
+      - SQLAlchemy/psycopg `rowcount` is not reliable for INSERT .. ON CONFLICT across drivers.
+      - We use `RETURNING 1` and count returned rows for a stable, deterministic upsert count.
     """
     sql = text(
         """
@@ -326,9 +334,10 @@ def _compute_dev_daily(db: Session, *, org_id: UUID, repo_id: Optional[UUID], st
           prs_merged_count = EXCLUDED.prs_merged_count,
           merges_count = EXCLUDED.merges_count,
           updated_at = now()
+        RETURNING 1
         """
     )
-    res = db.execute(
+    rows = db.execute(
         sql,
         {
             "org_id": str(org_id),
@@ -336,8 +345,8 @@ def _compute_dev_daily(db: Session, *, org_id: UUID, repo_id: Optional[UUID], st
             "start_ts": start_ts,
             "end_ts": end_ts,
         },
-    )
-    return int(res.rowcount or 0)
+    ).fetchall()
+    return int(len(rows))
 
 
 # PUBLIC_INTERFACE
